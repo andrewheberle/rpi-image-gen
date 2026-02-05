@@ -17,11 +17,11 @@
 # X-Env-Var-boot_part_size-Valid: size
 # X-Env-Var-boot_part_size-Set: y
 #
-# X-Env-Var-rootfs_type: ext4
-# X-Env-Var-rootfs_type-Desc: System partition fileysystem type (ext4 or erofs) per-slot.
-# X-Env-Var-rootfs_type-Required: n
-# X-Env-Var-rootfs_type-Valid: ext4,erofs
-# X-Env-Var-rootfs_type-Set: y
+# X-Env-Var-system_part_mkfs: -T 0
+# X-Env-Var-system_part_mkfs-Desc: System partition mkfs arguments
+# X-Env-Var-system_part_mkfs-Required: n
+# X-Env-Var-system_part_mkfs-Valid: string
+# X-Env-Var-system_part_mkfs-Set: y
 #
 # X-Env-Var-system_part_size: 512M
 # X-Env-Var-system_part_size-Desc: System partition size per-slot.
@@ -67,3 +67,4 @@ mmdebstrap:
   packages:
     - dosfstools
     - e2fsprogs
+    - erofs-utils

@@ -2,8 +2,6 @@
 #
 # Kernel module specific tweaks for AB when erofs is used for root
 
-[[ ${IGconf_image_rootfs_type:?} != erofs ]] && exit 0
-
 set -eu
 
 mkdir -p $1/etc/initramfs-tools/hooks
