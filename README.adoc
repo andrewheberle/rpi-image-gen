@@ -1,5 +1,7 @@
 = rpi-image-gen
 
+**Note:** This fork adjusts the upstream `image-rota` layer so that the system partition is an immutable/read-only `erofs` filesystem.
+
 rpi-image-gen is a tool for creating custom software images for Raspberry Pi devices. It runs best on a Raspberry Pi Host running up-to-date 64-bit Raspberry Pi OS.
 
 **For the tool used to create the Raspberry Pi OS distribution, please go to https://github.com/RPi-Distro/pi-gen**
