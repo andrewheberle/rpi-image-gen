@@ -108,6 +108,7 @@ ctx[SRCROOT]="${SRCROOT:-$(realpath -e .)}"
 
 ###############################################################################
 # Stage 1: Parameter assembly
+#   Read registry
 #   Parse config
 #   Seed env for subsequent stages
 ###############################################################################
@@ -115,18 +116,9 @@ parameter_assembly()
 {
    msg "\nPARAM"
 
-   # Toolchain variables. Native unless ARCH forces cross.
-   DEB_BUILD_ARCH_VAL="${DEB_BUILD_ARCH:-$(dpkg-architecture -qDEB_BUILD_ARCH)}"
-   DEB_BUILD_GNU_TYPE_VAL="${DEB_BUILD_GNU_TYPE:-$(dpkg-architecture -a"$DEB_BUILD_ARCH_VAL" -qDEB_BUILD_GNU_TYPE)}"
-
-   if [ -n "${ARCH:-}" ]; then
-      DEB_HOST_ARCH_VAL=${DEB_HOST_ARCH:-$(dpkg-architecture -a"$ARCH" -qDEB_HOST_ARCH)}
-   else
-      DEB_HOST_ARCH_VAL=${DEB_HOST_ARCH:-$DEB_BUILD_ARCH_VAL}
-   fi
-   DEB_HOST_GNU_TYPE_VAL="${DEB_HOST_GNU_TYPE:-$(dpkg-architecture -a"$DEB_HOST_ARCH_VAL" -qDEB_HOST_GNU_TYPE)}"
-
-   TOOLCHAIN_MODE=$([ "$DEB_BUILD_ARCH_VAL" = "$DEB_HOST_ARCH_VAL" ] && echo native || echo cross)
+   # Seed with registry defaults
+   ig metadata --emit "$IGTOP/registry.defs" > "${TMPDIR}/registry.env" \
+      || die "Failed to parse registry"
 
    # Read config, writing all settings to file. Deferred variable resolution in pipeline
    # means that variable expansion does not happen here, so a config file can use any
@@ -136,8 +128,28 @@ parameter_assembly()
       --path "$HOST_CONFIG_PATH" \
       "$HOST_CONFIG_FILE"     \
       --overrides "$OVRF" \
-      --write-to "${TMPDIR}/config.env" \
+      --write-to "${TMPDIR}/userconfig.env" \
       || die "Config parse failed"
+
+   # Prepend registry defaults so config overrides (last wins)
+   cat "${TMPDIR}/registry.env" "${TMPDIR}/userconfig.env" > "${TMPDIR}/config.env"
+
+   # Toolchain variables. Native unless ARCH forces cross.
+   if [ -z "${ARCH:-}" ]; then
+      ARCH=$(get_var ARCH "${TMPDIR}/config.env") || true
+   fi
+
+   DEB_BUILD_ARCH_VAL="${DEB_BUILD_ARCH:-$(dpkg-architecture -qDEB_BUILD_ARCH)}"
+   DEB_BUILD_GNU_TYPE_VAL="${DEB_BUILD_GNU_TYPE:-$(dpkg-architecture -a"$DEB_BUILD_ARCH_VAL" -qDEB_BUILD_GNU_TYPE)}"
+
+   if [ -n "${ARCH:-}" ]; then
+      DEB_HOST_ARCH_VAL=${DEB_HOST_ARCH:-$(dpkg-architecture -a"$ARCH" -qDEB_HOST_ARCH 2>/dev/null)}
+   else
+      DEB_HOST_ARCH_VAL=${DEB_HOST_ARCH:-$DEB_BUILD_ARCH_VAL}
+   fi
+   DEB_HOST_GNU_TYPE_VAL="${DEB_HOST_GNU_TYPE:-$(dpkg-architecture -a"$DEB_HOST_ARCH_VAL" -qDEB_HOST_GNU_TYPE 2>/dev/null)}"
+
+   TOOLCHAIN_MODE=$([ "$DEB_BUILD_ARCH_VAL" = "$DEB_HOST_ARCH_VAL" ] && echo native || echo cross)
 
    # These canonical variables are always provided to pipeline
    cat >> "${TMPDIR}/config.env" <<EOF
@@ -324,7 +336,7 @@ prepare_build_config()
       # pass through
       _bdebstrap+=( --env "$key=$value" )
    }
-   msg "FINAL ENV"
+   msg "\nFINAL ENV"
    mapfile_kv "${ctx[FINALENV]}" process_conf_opt
 
    # Translate layer paths and load those that contain an mmdebstrap mapping

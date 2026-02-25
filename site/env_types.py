@@ -218,6 +218,11 @@ class XEnv:
         return f"{cls.LAYER_PREFIX}Conflicts"
 
     @classmethod
+    def layer_sets(cls) -> str:
+        """Build layer sets field: X-Env-Layer-Sets"""
+        return f"{cls.LAYER_PREFIX}Sets"
+
+    @classmethod
     def is_layer_field(cls, field_name: str) -> bool:
         """Check if field name is an X-Env-Layer field."""
         return field_name.startswith(cls.LAYER_PREFIX)
@@ -449,30 +454,29 @@ class EnvVariable:
         """
         Parse trigger rules.
         Syntax (one rule per line):
-          - "VALUE set TARGET=VAL [policy=...]"  # conditional
-          - "set TARGET=VAL [policy=...]"        # unconditional (or inherits previous condition)
+          - "when=VALUE set TARGET=VAL [policy=...]"  # conditional
+          - "set TARGET=VAL [policy=...]"             # unconditional
         """
         rules: List[TriggerRule] = []
         lines = [line.strip() for line in str(raw).splitlines() if line.strip()]
 
-        previous_condition: Optional[str] = None
         for line in lines:
             tokens = line.split()
-            if len(tokens) < 2:
-                raise ValueError(f"Trigger rule '{line}' for {var_name} is malformed")
+            if not tokens:
+                continue
 
-            # Detect whether the first token is an action or a condition
-            if tokens[0] in ACTION_PARSERS:
-                # If an action appears first, reuse the previous condition (if any); otherwise unconditional
-                condition = previous_condition
-                action = tokens[0]
-                action_args = tokens[1:]
-            else:
-                condition = tokens[0]
+            condition: Optional[str] = None
+            if tokens[0].startswith("when="):
+                condition = tokens[0][len("when="):].strip()
+                if not condition:
+                    raise ValueError(f"Trigger rule '{line}' for {var_name} is missing value in when=")
                 if len(tokens) < 2:
                     raise ValueError(f"Trigger rule '{line}' for {var_name} is missing an action keyword")
                 action = tokens[1]
                 action_args = tokens[2:]
+            else:
+                action = tokens[0]
+                action_args = tokens[1:]
 
             parser = ACTION_PARSERS.get(action)
             if not parser:
@@ -483,7 +487,6 @@ class EnvVariable:
 
             target, value, policy = parser(action_args, var_name, line)
             rules.append(TriggerRule(condition=condition, action=action, target=target, value=value, policy=policy))
-            previous_condition = condition
         return rules
 
     def validate_value(self, value: Optional[str] = None) -> List[str]:
@@ -519,7 +522,8 @@ class EnvLayer:
                  category: str = "general", deps: List[str] = None,
                  provides: List[str] = None, requires_provider: List[str] = None,
                  conflicts: List[str] = None, layer_type: str = "static",
-                 generator: str = "", config_file: str = ""):
+                 generator: str = "", config_file: str = "",
+                 sets: Dict[str, str] = None):
         self.name = name
         self.description = description
         self.version = version
@@ -531,6 +535,7 @@ class EnvLayer:
         self.layer_type = layer_type
         self.generator = generator
         self.config_file = config_file
+        self.sets = sets or {}
 
     @classmethod
     def from_metadata_fields(cls, metadata_dict: Dict[str, str],
@@ -567,6 +572,9 @@ class EnvLayer:
         conflicts_str = metadata_dict.get(XEnv.layer_conflicts(), "")
         conflicts = cls._parse_dependency_list(conflicts_str, doc_mode)
 
+        sets_str = metadata_dict.get(XEnv.layer_sets(), "")
+        sets = cls._parse_sets(sets_str)
+
         # Infer config file from filepath if not provided
         import os
         config_file = os.path.basename(filepath) if filepath else f"{layer_name}.yaml"
@@ -582,7 +590,8 @@ class EnvLayer:
             conflicts=conflicts,
             layer_type=layer_type,
             generator=generator,
-            config_file=config_file
+            config_file=config_file,
+            sets=sets,
         )
 
     @staticmethod
@@ -611,6 +620,25 @@ class EnvLayer:
                     raise ValueError(f"Invalid dependency name '{dep_name}' - only alphanum, dash, underscore allowed")
                 deps.append(dep_name)
         return deps
+
+    @staticmethod
+    def _parse_sets(sets_str: str) -> Dict[str, str]:
+        """Parse 'KEY=VALUE KEY2=VALUE2 ...' into a dict."""
+        result: Dict[str, str] = {}
+        for token in sets_str.split():
+            if '=' not in token:
+                raise ValueError(
+                    f"Invalid Sets token '{token}' — expected KEY=VALUE"
+                )
+            key, value = token.split('=', 1)
+            if not key:
+                raise ValueError(f"Empty key in Sets token '{token}'")
+            if key.startswith("IGconf_"):
+                raise ValueError(
+                    f"Sets key '{key}' uses IGconf_ prefix — use X-Env-Var instead"
+                )
+            result[key] = value
+        return result
 
     @staticmethod
     def _evaluate_env_variables(text: str, doc_mode: bool = False) -> str:
@@ -687,6 +715,7 @@ class EnvLayer:
             "config_file": self.config_file,
             "provides": self.provides,
             "provider_requires": self.requires_provider,
+            "sets": self.sets,
         }
 
     def __repr__(self) -> str:
@@ -805,26 +834,92 @@ class MetadataContainer:
 class VariableResolver:
     """Resolves final variable values from multiple definitions using policy rules."""
 
+    MAX_TRIGGER_ITERATIONS = 16
+
     def __init__(self):
         pass
 
     def resolve(self, variable_definitions: Dict[str, List[EnvVariable]]) -> Dict[str, EnvVariable]:
         """
-        Resolve variables, then apply trigger rules once and re-resolve with
-        any injected variables.
+        Resolve variables and trigger injections until the injected set reaches
+        a stable fixed point.
         """
-        resolved = self._resolve_pass(variable_definitions)
+        max_iterations = self.MAX_TRIGGER_ITERATIONS
+        base_defs: Dict[str, List[EnvVariable]] = {k: list(v) for k, v in variable_definitions.items()}
+        current_defs: Dict[str, List[EnvVariable]] = self._normalise_definition_map(base_defs)
+        current_signature = self._definition_map_signature(current_defs)
 
-        trigger_defs = self._collect_trigger_definitions(resolved)
-        if not trigger_defs:
-            return resolved
+        for _ in range(max_iterations):
+            resolved = self._resolve_pass(current_defs)
+            trigger_defs = self._collect_trigger_definitions(resolved)
+            next_defs = self._merge_base_and_triggers(base_defs, trigger_defs)
+            next_signature = self._definition_map_signature(next_defs)
+            if next_signature == current_signature:
+                return resolved
+            current_defs = next_defs
+            current_signature = next_signature
 
-        merged_defs: Dict[str, List[EnvVariable]] = {k: list(v) for k, v in variable_definitions.items()}
+        raise ValueError(
+            "Trigger resolution did not converge after "
+            f"{max_iterations} iterations (possible cyclic trigger dependencies)"
+        )
+
+    @staticmethod
+    def _definition_key(env_var: EnvVariable) -> Tuple[Any, ...]:
+        """Return a stable key representing one variable definition."""
+        return (
+            env_var.name,
+            env_var.value,
+            env_var.set_policy,
+            env_var.source_layer,
+            env_var.position,
+            env_var.required,
+            getattr(env_var, "validation_rule", ""),
+            env_var.anchor_name,
+        )
+
+    def _normalise_definition_map(
+        self,
+        definition_map: Dict[str, List[EnvVariable]],
+    ) -> Dict[str, List[EnvVariable]]:
+        """
+        Return a map with exact duplicate definitions removed while preserving
+        relative ordering.
+        """
+        normalised: Dict[str, List[EnvVariable]] = {}
+        for name, defs in definition_map.items():
+            seen = set()
+            deduped: List[EnvVariable] = []
+            for env_var in defs:
+                key = self._definition_key(env_var)
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(env_var)
+            normalised[name] = deduped
+        return normalised
+
+    def _merge_base_and_triggers(
+        self,
+        base_defs: Dict[str, List[EnvVariable]],
+        trigger_defs: Dict[str, List[EnvVariable]],
+    ) -> Dict[str, List[EnvVariable]]:
+        """
+        Compose the next definition map from immutable base definitions plus
+        trigger-injected definitions generated for the current iteration.
+        """
+        merged: Dict[str, List[EnvVariable]] = {k: list(v) for k, v in base_defs.items()}
         for name, defs in trigger_defs.items():
-            merged_defs.setdefault(name, []).extend(defs)
+            merged.setdefault(name, []).extend(defs)
+        return self._normalise_definition_map(merged)
 
-        # Re-run resolution so triggers participate in normal policy handling
-        return self._resolve_pass(merged_defs)
+    def _definition_map_signature(self, definition_map: Dict[str, List[EnvVariable]]) -> Tuple[Any, ...]:
+        """Build a stable signature so we can detect fixed-point convergence."""
+        signature = []
+        for name in sorted(definition_map.keys()):
+            defs = definition_map[name]
+            signature.append((name, tuple(self._definition_key(env_var) for env_var in defs)))
+        return tuple(signature)
 
     def _resolve_pass(self, variable_definitions: Dict[str, List[EnvVariable]]) -> Dict[str, EnvVariable]:
         """
@@ -856,51 +951,16 @@ class VariableResolver:
             resolved_var = self._resolve_single_variable(var_name, definitions)
             if resolved_var:
                 # Merge triggers from all definitions so upstream triggers are preserved
-                seen = set()
-                merged_triggers: List[TriggerRule] = []
-                for d in definitions:
-                    for trig in getattr(d, "triggers", []) or []:
-                        key = (
-                            trig.condition,
-                            trig.action,
-                            trig.target,
-                            trig.value,
-                            trig.policy,
-                        )
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        merged_triggers.append(trig)
+                merged_triggers = self._merge_unique_triggers(definitions)
                 if merged_triggers:
                     resolved_var.triggers = merged_triggers
                 resolved[var_name] = resolved_var
             elif var_name in os.environ:
                 # Variable is in environment - keep triggers so they can still fire
                 first_def = definitions[0]
-                seen = set()
-                merged_triggers: List[TriggerRule] = []
-                for d in definitions:
-                    for trig in getattr(d, "triggers", []) or []:
-                        key = (
-                            trig.condition,
-                            trig.action,
-                            trig.target,
-                            trig.value,
-                            trig.policy,
-                        )
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        merged_triggers.append(trig)
+                merged_triggers = self._merge_unique_triggers(definitions)
                 # Merge conflicts from definitions so env/CLI overrides carry conflict metadata
-                merged_conflicts: List[str] = []
-                seen_conf = set()
-                for d in definitions:
-                    for c in getattr(d, "conflicts", []) or []:
-                        if c in seen_conf:
-                            continue
-                        seen_conf.add(c)
-                        merged_conflicts.append(c)
+                merged_conflicts = self._merge_unique_conflicts(definitions)
                 max_position = max(d.position for d in definitions)
                 env_var = EnvVariable(
                     name=var_name,
@@ -920,12 +980,55 @@ class VariableResolver:
 
         return resolved
 
+    @staticmethod
+    def _merge_unique_triggers(definitions: List[EnvVariable]) -> List[TriggerRule]:
+        """Collect trigger rules from definitions preserving first-seen order."""
+        seen = set()
+        merged: List[TriggerRule] = []
+        for definition in definitions:
+            for trig in getattr(definition, "triggers", []) or []:
+                key = (
+                    trig.condition,
+                    trig.action,
+                    trig.target,
+                    trig.value,
+                    trig.policy,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(trig)
+        return merged
+
+    @staticmethod
+    def _merge_unique_conflicts(definitions: List[EnvVariable]) -> List[str]:
+        """Collect conflict specs from definitions preserving first-seen order."""
+        seen = set()
+        merged: List[str] = []
+        for definition in definitions:
+            for conflict in getattr(definition, "conflicts", []) or []:
+                if conflict in seen:
+                    continue
+                seen.add(conflict)
+                merged.append(conflict)
+        return merged
+
     def _collect_trigger_definitions(self, resolved: Dict[str, EnvVariable]) -> Dict[str, List[EnvVariable]]:
         """Build trigger-sourced definitions based on resolved values."""
+        import os
+
         trigger_defs: Dict[str, List[EnvVariable]] = {}
         for env_var in resolved.values():
+            # Trigger conditions evaluate against the effective runtime value.
+            effective_value = os.environ.get(env_var.name, env_var.value)
             for rule in getattr(env_var, "triggers", []) or []:
-                if rule.condition is not None and env_var.value != rule.condition:
+                if rule.condition is not None and not self._trigger_condition_matches(
+                    rule.condition,
+                    env_var.name,
+                    str(effective_value),
+                    resolved,
+                    env_var.source_layer,
+                ):
                     continue
                 if rule.action != "set":
                     raise ValueError(f"Unsupported trigger action '{rule.action}' for variable '{env_var.name}'")
@@ -948,15 +1051,60 @@ class VariableResolver:
                     validation_rule=target_validation_rule,
                     set_policy=rule.policy or TRIGGER_DEFAULT_POLICY,
                     source_layer=env_var.source_layer or "trigger",
-                    # Place injected definition just after the source variable’s position
-                    # so triggers fire after the source but can still be overridden by
-                    # later layer definitions in normal force ordering.
-                    position=env_var.position + 0.01,
+                    position=env_var.position,
                     anchor_name=target_anchor,
                     triggers=[],
                 )
                 trigger_defs.setdefault(rule.target, []).append(injected)
         return trigger_defs
+
+    def _trigger_condition_matches(
+        self,
+        condition: str,
+        source_var_name: str,
+        source_effective_value: str,
+        resolved: Dict[str, EnvVariable],
+        source_layer: Optional[str] = None,
+    ) -> bool:
+        """
+        Evaluate trigger condition.
+
+        Supported forms:
+        - same-variable value condition: "btrfs"
+        - cross-variable equality: "IGconf_device_storage_type=emmc"
+        - cross-variable inequality: "IGconf_device_storage_type!=emmc"
+        """
+        import os
+
+        if "!=" in condition:
+            lhs, rhs = condition.split("!=", 1)
+            op = "!="
+        elif "=" in condition:
+            lhs, rhs = condition.split("=", 1)
+            op = "="
+        else:
+            return source_effective_value == condition
+
+        lhs = lhs.strip()
+        rhs = rhs.strip()
+        if not lhs:
+            return False
+
+        if lhs == source_var_name:
+            lhs_value = source_effective_value
+        elif lhs in os.environ:
+            lhs_value = str(os.environ.get(lhs, ""))
+        elif lhs in resolved:
+            lhs_value = str(resolved[lhs].value)
+        else:
+            layer_note = f" (layer: {source_layer})" if source_layer else ""
+            raise ValueError(
+                f"Unknown variable '{lhs}' referenced in trigger condition '{condition}'{layer_note}"
+            )
+
+        if op == "=":
+            return lhs_value == rhs
+        return lhs_value != rhs
 
     def _resolve_single_variable(self, var_name: str, definitions: List[EnvVariable]) -> Optional[EnvVariable]:
         """Resolve a single variable using policy rules."""
@@ -966,6 +1114,7 @@ class VariableResolver:
         force_defs = [d for d in definitions if d.set_policy == "force"]
         immediate_defs = [d for d in definitions if d.set_policy == "immediate"]
         lazy_defs = [d for d in definitions if d.set_policy == "lazy"]
+        skip_defs = [d for d in definitions if d.set_policy == "skip"]
 
         # Rule a: If any variable is defined as force, use the last force definition
         if force_defs:
@@ -979,14 +1128,42 @@ class VariableResolver:
         elif lazy_defs and var_name not in os.environ:
             return self._get_last_by_position(lazy_defs)
 
+        # Rule d: If only skip, still return one so validation can check required
+        elif skip_defs:
+            return self._get_last_by_position(skip_defs)
+
         # Variable is set in environment or no applicable definitions
         return None
 
     def _get_first_by_position(self, definitions: List[EnvVariable]) -> EnvVariable:
-        """Get the definition with the earliest position (first in dependency order)."""
-        return min(definitions, key=lambda d: d.position)
+        """
+        Get the earliest definition by layer position.
+        If positions tie, prefer the first definition in list order.
+        """
+        best_idx = 0
+        best = definitions[0]
+        for idx, definition in enumerate(definitions[1:], start=1):
+            if definition.position < best.position:
+                best_idx = idx
+                best = definition
+            elif definition.position == best.position and idx < best_idx:
+                best_idx = idx
+                best = definition
+        return best
 
     def _get_last_by_position(self, definitions: List[EnvVariable]) -> EnvVariable:
-        """Get the definition with the latest position (last in dependency order)."""
-        return max(definitions, key=lambda d: d.position)
+        """
+        Get the latest definition by layer position.
+        If positions tie, prefer the last definition in list order.
+        """
+        best_idx = 0
+        best = definitions[0]
+        for idx, definition in enumerate(definitions[1:], start=1):
+            if definition.position > best.position:
+                best_idx = idx
+                best = definition
+            elif definition.position == best.position and idx > best_idx:
+                best_idx = idx
+                best = definition
+        return best
 

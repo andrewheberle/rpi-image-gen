@@ -6,6 +6,7 @@ set -uo pipefail
 
 IGTOP=$(readlink -f "$(dirname "$0")/../../")
 META="${IGTOP}/test/meta"
+FIXTURE_TRIGGER_CASCADE_DIR="${META}/fixtures/trigger-cascade-cross-layer"
 PIPELINE_DIR=$(mktemp -d -t meta-layers.XXXXXX)
 trap 'rm -rf "$PIPELINE_DIR"' EXIT
 
@@ -233,6 +234,26 @@ run_test "triggers-set" \
     0 \
     "Trigger rules should set target variables (including inherited condition actions)"
 
+run_test "triggers-set-skip-env-override" \
+    'cleanup_env; TMP_OUT=$(mktemp); IGconf_trigskip_rootfs_type=btrfs ig metadata --parse ${META}/valid-triggers-skip-env-override.yaml --write-out "$TMP_OUT" && grep "^IG_TRIG_SKIP=\"1\"$" "$TMP_OUT"; status=$?; rm -f "$TMP_OUT"; exit $status' \
+    0 \
+    "Trigger rules should use effective env values even when Set: n"
+
+run_test "triggers-set-cross-var-when" \
+    'cleanup_env; TMP_OUT=$(mktemp); IGconf_trigx_mode=fast ig metadata --parse ${META}/valid-triggers-cross-var-when.yaml --write-out "$TMP_OUT" && grep "^IG_TRIG_X=\"1\"$" "$TMP_OUT"; status=$?; rm -f "$TMP_OUT"; exit $status' \
+    0 \
+    "Trigger rules should support when=VAR=VALUE cross-variable conditions"
+
+run_test "triggers-fixpoint-cascade" \
+    'cleanup_env; TMP_OUT=$(mktemp); IGconf_cascade_variant=lite ig metadata --parse ${META}/valid-triggers-fixpoint-cascade.yaml --write-out "$TMP_OUT" && grep "^IGconf_cascade_storage_type=\"sd\"$" "$TMP_OUT" && grep "^IGconf_cascade_ptable_protect=\"n\"$" "$TMP_OUT"; status=$?; rm -f "$TMP_OUT"; exit $status' \
+    0 \
+    "Trigger cascades should re-evaluate conditions until stable"
+
+run_test "triggers-fixpoint-no-override-stable" \
+    'cleanup_env; TMP_OUT=$(mktemp); ig metadata --parse ${META}/valid-triggers-fixpoint-cascade.yaml --write-out "$TMP_OUT" && grep "^IGconf_cascade_storage_type=\"emmc\"$" "$TMP_OUT" && grep "^IGconf_cascade_ptable_protect=\"y\"$" "$TMP_OUT"; status=$?; rm -f "$TMP_OUT"; exit $status' \
+    0 \
+    "Fixed-point trigger resolution should converge without overrides"
+
 # ---------------------------------------------------------------------------
 print_header "INVALID METADATA TESTS"
 
@@ -322,6 +343,11 @@ run_test "invalid-trigger-action-parse" \
     1 \
     "Unknown trigger action should fail to parse"
 
+run_test "invalid-trigger-legacy-condition-parse" \
+    "ig metadata --parse ${META}/invalid-trigger-legacy-condition.yaml" \
+    1 \
+    "Legacy trigger condition syntax without when= should fail to parse"
+
 cleanup_env
 run_test "invalid-trigger-validation" \
     "cleanup_env; ig metadata --parse ${META}/invalid-trigger-validation.yaml" \
@@ -339,6 +365,11 @@ run_test "invalid-trigger-env-override" \
     "cleanup_env; IGconf_image_rootfs_type=btrfs ig metadata --parse ${META}/invalid-trigger-env-override.yaml" \
     1 \
     "Trigger should fire when source var is overridden via env/config"
+
+run_test "invalid-trigger-cross-var-missing-var" \
+    "cleanup_env; ig metadata --parse ${META}/invalid-triggers-cross-var-missing-var.yaml" \
+    1 \
+    "Cross-variable trigger condition should fail when referenced var is missing"
 
 run_test "invalid-yaml-syntax-layer-validate" \
     "ig metadata --validate ${META}/invalid-yaml-syntax.yaml" \
@@ -458,6 +489,84 @@ run_test "layer-apply-env-valid" \
     0 \
     "Pipeline apply-env should work with valid metadata"
 
+run_test "layer-apply-env-validates-against-resolved-definition" \
+    'TMP_ENV=$(mktemp) && TMP_OUT=$(mktemp) && \
+     make_pipeline_env "$TMP_ENV" && \
+     ig pipeline --env-in "$TMP_ENV" --layers test-resolved-validator-base test-resolved-validator-consumer --path "${PIPELINE_DIR}" --env-out "$TMP_OUT" >/dev/null && \
+     grep -q "^IGconf_device_storage_type=emmc8G$" "$TMP_OUT" && \
+     grep -q "^IGconf_image_size=8G$" "$TMP_OUT"; \
+     status=$?; rm -f "$TMP_ENV" "$TMP_OUT"; exit $status' \
+    0 \
+    "Pipeline should validate storage_type using the resolved consumer definition"
+
+run_test "layer-apply-env-conflict-with-env-overrides" \
+    'TMP_ENV=$(mktemp) && TMP_OUT=$(mktemp) && TMP_DIR=$(mktemp -d) && \
+     cat > "$TMP_DIR/base.yaml" << "EOF" && \
+# METABEGIN
+# X-Env-Layer-Name: test-conflict-base
+# X-Env-Layer-Desc: Base layer for conflict regression
+# X-Env-Layer-Version: 1.0.0
+# X-Env-Layer-Category: test
+# X-Env-VarPrefix: cflt
+# X-Env-Var-variant: 8G
+# X-Env-Var-variant-Valid: 8G,16G,32G,lite
+# X-Env-Var-variant-Set: lazy
+# X-Env-Var-storage_type: sd
+# X-Env-Var-storage_type-Valid: sd,emmc
+# X-Env-Var-storage_type-Set: lazy
+# METAEND
+EOF
+     cat > "$TMP_DIR/consumer.yaml" << "EOF" && \
+# METABEGIN
+# X-Env-Layer-Name: test-conflict-consumer
+# X-Env-Layer-Desc: Variant conflicts with emmc when lite
+# X-Env-Layer-Version: 1.0.0
+# X-Env-Layer-Category: test
+# X-Env-Layer-Requires: test-conflict-base
+# X-Env-VarPrefix: cflt
+# X-Env-Var-variant: 8G
+# X-Env-Var-variant-Valid: 8G,16G,32G,lite
+# X-Env-Var-variant-Set: lazy
+# X-Env-Var-variant-Conflicts: when=lite storage_type=emmc
+# METAEND
+EOF
+     make_pipeline_env "$TMP_ENV" "IGconf_cflt_variant=lite" "IGconf_cflt_storage_type=emmc" && \
+     ig pipeline --env-in "$TMP_ENV" --layers test-conflict-consumer --path "$TMP_DIR" --env-out "$TMP_OUT" >/dev/null; \
+     status=$?; rm -f "$TMP_ENV" "$TMP_OUT"; rm -rf "$TMP_DIR"; exit $status' \
+    1 \
+    "Pipeline should reject conflicts evaluated from current env values"
+
+run_test "layer-apply-env-trigger-cascade-cross-layer-default" \
+    'TMP_ENV=$(mktemp) && TMP_OUT=$(mktemp) && \
+     make_pipeline_env "$TMP_ENV" && \
+     ig pipeline --env-in "$TMP_ENV" --layers cascade-image-rota --path "${PIPELINE_DIR}:${FIXTURE_TRIGGER_CASCADE_DIR}" --env-out "$TMP_OUT" >/dev/null && \
+     grep -q "^IGconf_cascade_storage_type=emmc$" "$TMP_OUT" && \
+     grep -q "^IGconf_cascade_ptable_protect=y$" "$TMP_OUT"; \
+     status=$?; rm -f "$TMP_ENV" "$TMP_OUT"; exit $status' \
+    0 \
+    "Cross-layer defaults should resolve to emmc with ptable protection enabled"
+
+run_test "layer-apply-env-trigger-cascade-cross-layer-lite" \
+    'TMP_ENV=$(mktemp) && TMP_OUT=$(mktemp) && \
+     make_pipeline_env "$TMP_ENV" "IGconf_cascade_variant=lite" && \
+     ig pipeline --env-in "$TMP_ENV" --layers cascade-image-rota --path "${PIPELINE_DIR}:${FIXTURE_TRIGGER_CASCADE_DIR}" --env-out "$TMP_OUT" >/dev/null && \
+     grep -q "^IGconf_cascade_storage_type=sd$" "$TMP_OUT" && \
+     grep -q "^IGconf_cascade_ptable_protect=n$" "$TMP_OUT"; \
+     status=$?; rm -f "$TMP_ENV" "$TMP_OUT"; exit $status' \
+    0 \
+    "Cross-layer trigger cascade should resolve lite to sd and disable ptable protection"
+
+run_test "layer-apply-env-layer-sets" \
+    'TMP_ENV=$(mktemp) && TMP_OUT=$(mktemp) && \
+     make_pipeline_env "$TMP_ENV" && \
+     ig pipeline --env-in "$TMP_ENV" --layers test-layer-sets --path "${PIPELINE_DIR}" --env-out "$TMP_OUT" >/dev/null && \
+     grep -q "^IG_ENABLE_HOST_BDEBSTRAP=y$" "$TMP_OUT" && \
+     grep -q "^IG_TEST_LAYER_SETS=active$" "$TMP_OUT" && \
+     grep -q "^IGconf_lsets_marker=present$" "$TMP_OUT"; \
+     status=$?; rm -f "$TMP_ENV" "$TMP_OUT"; exit $status' \
+    0 \
+    "Pipeline should inject X-Env-Layer-Sets variables into the environment"
+
 run_test "layer-apply-env-invalid" \
     'TMP_ENV=$(mktemp) && TMP_OUT=$(mktemp) && \
      make_pipeline_env "$TMP_ENV" && \
@@ -572,6 +681,11 @@ run_test "lint-no-metadata" \
     "ig metadata --lint ${META}/lint-no-metadata.yaml" \
     1 \
     "Lint should fail when no X-Env-* metadata fields exist"
+
+run_test "lint-unknown-xenv-field" \
+    "ig metadata --lint ${META}/lint-unknown-xenv-field.yaml" \
+    1 \
+    "Lint should fail on unknown top-level X-Env-* field names"
 
 cleanup_env
 print_summary
